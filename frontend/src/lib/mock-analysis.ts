@@ -15,111 +15,103 @@ export type AnalysisResult = {
   summary: string;
 };
 
+const BACKEND_URL = import.meta.env.VITE_BACKEND_URL || "http://localhost:3001";
+
+type BackendBreakdownItem = {
+  name: string;
+  score: number;
+  max: number;
+  flags: string[];
+  details: string;
+};
+
+type BackendResponse = {
+  score: number;
+  risk: "LOW" | "MEDIUM" | "HIGH";
+  signals: {
+    salary_realism: boolean;
+    company_exists: boolean;
+    contact_quality: boolean;
+    jd_quality: boolean;
+    suspicious_patterns: boolean;
+  };
+  breakdown: BackendBreakdownItem[];
+  explanation: string;
+  scored_at: string;
+  engine_version: string;
+};
+
+function findBreakdown(breakdown: BackendBreakdownItem[], name: string) {
+  return breakdown.find((b) => b.name === name);
+}
+
+function mapVerdict(risk: BackendResponse["risk"]): string {
+  if (risk === "LOW") return "Trusted";
+  if (risk === "MEDIUM") return "Caution";
+  return "High Risk";
+}
+
 export async function analyze(input: RecruiterInput): Promise<AnalysisResult> {
-  const apiKey = import.meta.env.VITE_GROQ_API_KEY;
+  // Make sure a checked "registration fee" checkbox actually reaches the scam regex,
+  // even if the recruiter didn't type it into the description.
+  const description = input.hasFee
+    ? `${input.description}\n\nNote: This posting requires a registration or training fee.`
+    : input.description;
 
-  if (!apiKey) {
-    throw new Error("VITE_GROQ_API_KEY is not defined");
-  }
-
-  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
+  const response = await fetch(`${BACKEND_URL}/analyze`, {
     method: "POST",
-    headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-    },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
-      model: "llama-3.3-70b-versatile",
-      messages: [
-        {
-          role: "system",
-          content: `You are a job trust verification engine. Analyze this job posting and return a trust score from 0–100 with breakdown. 
- 
- Score these factors: 
- - Domain credibility (check if website URL looks real, has HTTPS) → 20 pts 
- - Salary reality check (is salary realistic for this role + fresher/intern level?) → 20 pts 
- - JD quality (clear responsibilities, no fake promises, no 'guaranteed job') → 20 pts 
- - Company footprint (LinkedIn URL provided, founding year given) → 20 pts 
- - Recruiter authenticity (LinkedIn provided, professional email) → 20 pts 
- 
- Apply these penalties: 
- - Contact email is gmail/yahoo → -15 points 
- - Registration/training fee mentioned → -40 points 
- - Salary > 3x market rate for fresher → -20 points 
- - Unrealistic promises detected ('guaranteed', 'no experience 1L/month') → -25 points 
- 
- Apply these bonuses: 
- - Recruiter LinkedIn provided → +10 points 
- - Company LinkedIn provided → +10 points 
- - Company founding year provided → +5 points 
- 
- If Company Stage = 'Early Stage Startup': 
- DO NOT penalize for: new domain, no Glassdoor, small LinkedIn presence. 
- INSTEAD evaluate: founder credibility, salary transparency, honest about being early stage, clear role description. 
- A startup being honest about being small scores HIGHER than one pretending to be big. 
- 
- Return ONLY valid JSON: 
- { 
-   "trust_score": number, 
-   "verdict": "Trusted" | "Caution" | "High Risk", 
-   "breakdown": { 
-     "domain_credibility": number, 
-     "salary_reality": number, 
-     "jd_quality": number, 
-     "company_footprint": number, 
-     "recruiter_authenticity": number 
-   }, 
-   "red_flags": string[], 
-   "green_signals": string[], 
-   "summary": string 
- }`,
-        },
-        {
-          role: "user",
-          content: `Analyze this job posting:
-          
-          Company: ${input.company}
-          Job Title: ${input.jobTitle}
-          Salary: ${input.salary}
-          Website: ${input.website}
-          Job Description: ${input.description}
-          Company Stage: ${input.companyStage}
-          Recruiter LinkedIn: ${input.recruiterLinkedIn}
-          Company LinkedIn: ${input.companyLinkedIn}
-          Contact Email: ${input.contactEmail}
-          Registration Fee: ${input.hasFee ? "Yes" : "No"}
-          Founding Year: ${input.foundingYear}`,
-        },
-      ],
-      response_format: { type: "json_object" },
+      title: input.jobTitle,
+      company: input.company,
+      description,
+      url: input.website,
+      contact: input.contactEmail,
+      salary: input.salary,
     }),
   });
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({}));
-    throw new Error(`Groq API error: ${response.status} ${JSON.stringify(errorData)}`);
+    throw new Error(`Backend error: ${response.status} ${JSON.stringify(errorData)}`);
   }
 
-  const data = await response.json();
-  const text = data.choices[0].message.content;
+  const data: BackendResponse = await response.json();
 
-  // Robust JSON extraction
-  const jsonMatch = text.match(/\{[\s\S]*\}/);
-  if (!jsonMatch) throw new Error("No JSON in response");
-  const content = JSON.parse(jsonMatch[0]);
+  const jdItem = findBreakdown(data.breakdown, "JD Quality");
+  const companyItem = findBreakdown(data.breakdown, "Company Signal");
+  const contactItem = findBreakdown(data.breakdown, "Contact Quality");
+  const salaryItem = findBreakdown(data.breakdown, "Salary Realism");
 
-  const parseScore = (val: any) => {
-    if (typeof val === "number") return val;
-    const num = parseInt(String(val).replace(/[^0-9]/g, ""));
-    return isNaN(num) ? 0 : num;
+  // Backend tracks 5 categories, frontend UI wants a different 5 — not a perfect 1:1.
+  // domain_credibility and company_footprint both pull from "Company Signal" since
+  // the backend doesn't separate them. Fine for MVP.
+  const breakdown = {
+    domain_credibility: companyItem?.score ?? 0,
+    salary_reality: salaryItem?.score ?? 0,
+    jd_quality: jdItem?.score ?? 0,
+    company_footprint: companyItem?.score ?? 0,
+    recruiter_authenticity: contactItem?.score ?? 0,
   };
 
+  const red_flags: string[] = [];
+  for (const item of data.breakdown) {
+    red_flags.push(...item.flags);
+  }
+
+  const green_signals: string[] = [];
+  if (data.signals.jd_quality) green_signals.push("Job description is clear and detailed");
+  if (data.signals.company_exists) green_signals.push("Company website verified");
+  if (data.signals.contact_quality) green_signals.push("Contact details look legitimate");
+  if (data.signals.salary_realism) green_signals.push("Salary is realistic for this role");
+  if (!data.signals.suspicious_patterns) green_signals.push("No scam patterns detected");
+
   return {
-    trustScore: parseScore(content.trust_score),
-    verdict: content.verdict,
-    breakdown: content.breakdown,
-    red_flags: content.red_flags,
-    green_signals: content.green_signals,
-    summary: content.summary,
+    trustScore: data.score,
+    verdict: mapVerdict(data.risk),
+    breakdown,
+    red_flags,
+    green_signals,
+    summary: data.explanation,
   };
 }
